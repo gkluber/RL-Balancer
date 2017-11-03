@@ -9,6 +9,10 @@ OpenAI Gym<br>
 ```batch
 python -m pip install --upgrade tensorflow numpy gym 
 ```
+## Usage
+```batch
+python main.py --flag1 [value] --flag2 [value] (...)
+```
 ## References:<br>
 Williams, R.J. Mach Learn (1992) 8: 229. https://doi.org/10.1007/BF00992696<br>
 Peters, Jan. “Policy Gradient Methods.” Scholarpedia, Jan Peters, 2010, www.scholarpedia.org/article/Policy_gradient_methods.
