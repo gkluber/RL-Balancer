@@ -6,3 +6,6 @@ Requirements:<br>
 TensorFlow<br>
 NumPy<br>
 OpenAI Gym<br>
+```batch
+python -m pip install --upgrade tensorflow numpy gym 
+```
