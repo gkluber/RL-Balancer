@@ -15,7 +15,7 @@ flags.DEFINE_integer("epochs", 150, "Epochs to train on")
 flags.DEFINE_integer("max_steps", 500, "Maximum number of steps per episode (limited by the environment's limit of 500 steps)")
 flags.DEFINE_integer("games_per_update", 10, "Number of games played per update")
 flags.DEFINE_integer("save_iterations", 50, "Number of iterations per save")
-flags.DEFINE_integer("test_games", 50, "Number of games to test with")
+flags.DEFINE_integer("test_games", 5, "Number of games to test with")
 flags.DEFINE_string("checkpoint_dir", "checkpoints", "Directory that checkpoints will be saved in and loaded from")
 FLAGS = flags.FLAGS
 
