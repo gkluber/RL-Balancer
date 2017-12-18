@@ -1,4 +1,5 @@
 import threading, gym, tensorflow as tf, numpy as np, sys
+from numpy.linalg import inv
 
 class Balancer(object):
 	#stop = True
@@ -50,9 +51,13 @@ class Balancer(object):
 		y = 1 - tf.to_float(self.action) #probability of right
 		
 		#learning_rate = 0.1 
-		cross_entropy = tf.nn.sigmoid_cross_entropy_with_logits(labels=y, logits=logits)
+		self.cross_entropy = tf.nn.sigmoid_cross_entropy_with_logits(labels=y, logits=logits)
+		def kl_loss(p,q):
+			return p*tf.log(p/q) + (1 - p)*tf.log((1-p)/(1-q))
+		
+		self.kl_loss = tf.contrib.distributions.kl(y, logits)
 		self.optimizer = tf.train.AdamOptimizer(self.learning_rate, self.beta1, self.beta2)
-		grads_and_vars = self.optimizer.compute_gradients(cross_entropy)
+		grads_and_vars = self.optimizer.compute_gradients(self.cross_entropy)
 		self.gradients = [grad for grad, var in grads_and_vars]
 		self.gradient_placeholders = []
 		grads_and_vars_feed = []
@@ -64,6 +69,15 @@ class Balancer(object):
 
 		self.init = tf.global_variables_initializer()
 		self.saver = tf.train.Saver()
+		
+		#summary  statistics for use with Tensorboard
+		self.step_placeholder = tf.placeholder(tf.float32, shape=())
+		#self.baseline_placeholder = tf.placeholder(tf.float32, shape=())
+		tf.summary.scalar("steps",self.step_placeholder)
+		#tf.summary.scalar("baseline",self.baseline_placeholder)
+		self.summary = tf.summary.merge_all()
+		self.train_writer = tf.summary.FileWriter('summary/train', self.sess.graph)
+		self.test_writer = tf.summary.FileWriter('summary/test', self.sess.graph)
 		
 		if not self.ignore_checkpoint:
 			self.load_model()
@@ -85,6 +99,9 @@ class Balancer(object):
 		reward_std = flat_rewards.std()
 		return [(discounted_rewards - reward_mean)/reward_std for discounted_rewards in all_discounted_rewards]
 
+	def discount_rewards_2d(self, all_rewards, discount_rate):
+		return [self.discount_rewards(rewards, discount_rate) for rewards in all_rewards]
+	
 	def use_manual(self):
 		self.stop = False
 		self.env.reset()
@@ -131,6 +148,7 @@ class Balancer(object):
 		for iteration in range(self.epochs):
 			all_rewards = [] #all sequences of raw rewards for each episode
 			all_gradients = [] #gradients saved at each step of each episode
+			steps = []
 			for game in range(self.games_per_update):
 				print("Running game #{}".format(game))
 				current_rewards = []
@@ -143,27 +161,63 @@ class Balancer(object):
 					obs, reward, done, info = self.env.step(action_val[0][0])
 					current_rewards.append(reward) #raw reward
 					current_gradients.append(gradients_val) #raw grads
-					if done:
+					if done or step==self.max_steps-1:
 						print("Finished game #{} in {} steps".format(game,step+1))
+						steps.append(step)
 						break
-					elif step==self.max_steps-1:
-						print("Hit max num of steps at game #{}".format(game))
-				
 				all_rewards.append(current_rewards) #adds to the history of rewards
 				all_gradients.append(current_gradients) #gradient history
+			
 			#all games executed--time to perform policy gradient ascent
 			print("Performing gradient ascent at iteration {}".format(iteration))
 			all_rewards = self.discount_and_normalize_rewards(all_rewards, self.discount_rate)
+			mean_reward = np.array(np.mean(
+					[reward
+						for rewards in all_rewards
+						for reward in rewards],
+					axis=0),dtype=np.float32)
+			mean_steps = np.mean(steps,axis=0)
 			feed_dict = {}
 			for var_index, grad_placeholder in enumerate(self.gradient_placeholders):
 				#multiplication by the "action scores" obtained from discounting the future events appropriately--meaned to average the signals
-				mean_gradients = np.mean(
+				M = self.games_per_update #M trials per iteration
+				N = len(all_gradients[0][0][var_index]) #N variables involved here--N rows guaranteed
+				vanilla_gradient = np.array(np.mean(
 					[reward*all_gradients[game_index][step][var_index] #iterates through each variable in the gradient (var_index)
 						for game_index, rewards in enumerate(all_rewards)
 						for step,reward in enumerate(rewards)],
-					axis=0)
-				feed_dict[grad_placeholder] = mean_gradients
+					axis=0),dtype=np.float32).reshape((N,-1)) #may be 4x4
+				vanilla_sum = N*vanilla_gradient
+				
+				eligibility = np.array(np.mean(
+					[grad[var_index]
+						for grads in all_gradients
+						for grad in grads],
+					axis=0),dtype=np.float32).reshape((N,-1))
+				natural_gradients = np.zeros(vanilla_gradient.shape)
+				for grad_var in range(vanilla_gradient.shape[1]):
+					current_eligibility = eligibility[:,grad_var].reshape((N,1))
+					current_vanilla = vanilla_gradient[:,grad_var].reshape((N,1))
+					print(current_eligibility.shape)
+					fisher = N*np.matmul(current_eligibility,current_eligibility.transpose()).reshape((N,N)) #guaranteed to be NxN
+					inv_fisher = inv(fisher)
+					
+					#computation of the natural gradient
+					Q = 1.0/M*(1 + np.matmul(current_eligibility.transpose(),np.matmul(inv(M*fisher - np.matmul(current_eligibility,current_eligibility.transpose())),current_eligibility)))
+					baseline = Q*(mean_reward-np.matmul(current_eligibility.transpose(),np.matmul(inv_fisher,current_vanilla)))
+					print("M: {}\nN: {}\nVanilla grad: {}\nEligibility: {}\nFisher: {}\nInverse Fisher: {}\nMean reward: {}\nQ: {}\nBaseline: {}\n".format(
+						M,N,current_vanilla,current_eligibility,fisher,inv_fisher,mean_reward,Q,baseline))
+					natural_gradients[:,grad_var] = np.squeeze(np.matmul(inv_fisher,current_vanilla-current_eligibility*baseline).reshape((N,-1)))
+				
+				if var_index == 1 or var_index == 3:
+					natural_gradients = np.squeeze(natural_gradients,axis=1)
+				#if var_index == 2:
+				#	natural_gradients = natural_gradients
+				print(natural_gradients)
+				feed_dict[grad_placeholder] = natural_gradients
 			self.sess.run(self.training_op,feed_dict=feed_dict)
+			sum = self.sess.run(self.summary,feed_dict={self.step_placeholder:mean_steps})
+			self.train_writer.add_summary(sum,iteration)
 			if (iteration +1)% self.save_iterations == 0 and self.save:
 				print("Saving model...")
 				self.saver.save(self.sess,self.get_checkpoint_file())
@@ -182,6 +236,8 @@ class Balancer(object):
 				counter+=1
 				if done or step==self.max_steps-1:
 					pause = input("Press enter to continue")
+					sum = self.sess.run(self.summary, feed_dict={self.step_placeholder:step})
+					self.test_writer.add_summary(sum,game)
 					break
 			steps.append(counter)
 		steps_arr = np.array(steps,np.int32)
